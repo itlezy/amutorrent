@@ -115,6 +115,8 @@ function normalizeAmuleDownload(download, resolveCategoryName = () => 'Default')
     rawName: download.rawFileName,
     size: download.fileSize,
     downloaded: download.fileSizeDownloaded,
+    // Bytes-equality (verified parts) — lib's progress is toFixed(2), rounds 99.995% to "100.00".
+    isComplete: download.fileSize > 0 && download.fileSizeDownloaded >= download.fileSize,
     category: catId,
     categoryName,
     ed2kLink: download.ed2kLink || download.EC_TAG_PARTFILE_ED2K_LINK || download.raw?.EC_TAG_PARTFILE_ED2K_LINK || null,
@@ -412,7 +414,7 @@ function normalizeQBittorrentDownload(torrent) {
     hash: torrent.hash.toLowerCase(),
     name: torrent.name,
     size: torrent.size || torrent.total_size,
-    downloaded: torrent.completed || torrent.downloaded,
+    downloaded: torrent.completed || 0,
     progress,
     speed: torrent.dlspeed || 0,
     uploadSpeed: torrent.upspeed || 0,
@@ -424,7 +426,8 @@ function normalizeQBittorrentDownload(torrent) {
     label: torrent.category || '', // Alias for compatibility with rtorrent
     directory,
     uploadTotal: torrent.uploaded || 0,
-    isComplete: progress >= 100,
+    // Use raw 0–1 fraction, not the toFixed(2) display value.
+    isComplete: (torrent.progress || 0) >= 1.0,
     isActive: ['downloading', 'uploading', 'stalledDL', 'stalledUP', 'forcedDL', 'forcedUP'].includes(torrent.state),
     isMultiFile: multiFile,
     message: getQBittorrentMessage(torrent), // Error message or tracker status
@@ -500,7 +503,8 @@ function normalizeDelugeDownload(hash, torrent) {
     label: torrent.label || '',
     directory: torrent.save_path || '',
     uploadTotal: torrent.total_uploaded || 0,
-    isComplete: progress >= 100,
+    // Use raw 0–100 value, not the toFixed(2) display value.
+    isComplete: (torrent.progress || 0) >= 100,
     isActive: ['Downloading', 'Seeding'].includes(torrent.state),
     isMultiFile,
     message: torrent.state === 'Error' ? (torrent.message || 'Error') : '',
@@ -580,7 +584,8 @@ function normalizeTransmissionDownload(torrent) {
     hash,
     name: torrent.name || '',
     size: torrent.totalSize || 0,
-    downloaded: torrent.downloadedEver || 0,
+    // haveValid + haveUnchecked = bytes on disk. downloadedEver is lifetime and can exceed totalSize on poisoned torrents.
+    downloaded: (torrent.haveValid || 0) + (torrent.haveUnchecked || 0),
     progress,
     speed: torrent.rateDownload || 0,
     uploadSpeed: torrent.rateUpload || 0,

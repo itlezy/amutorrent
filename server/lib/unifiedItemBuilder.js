@@ -106,8 +106,10 @@ function applyDownloadData(item, download, categoryManager = null) {
   item.sizeDownloaded = download.downloaded || item.sizeDownloaded;
   item.progress = download.progress ?? (item.size > 0 ? Math.round((item.sizeDownloaded / item.size) * 100) : 0);
   item.downloadSpeed = download.speed || item.downloadSpeed;
-  item.downloading = item.progress < 100;
-  item.complete = item.progress >= 100;
+  // Trust the per-client authoritative completion flag set in the normalizer; never re-derive
+  // from the rounded display progress, which can fire 0.005% early on big files.
+  item.complete = !!download.isComplete;
+  item.downloading = !item.complete;
   item.status = resolveStatus(download);
 
   // ETA calculation (in seconds)
