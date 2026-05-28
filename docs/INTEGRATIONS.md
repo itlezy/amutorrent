@@ -148,7 +148,19 @@ The qBittorrent-compatible API allows *arr applications to manage downloads.
 5. Click **Test** to verify connection
 6. Click **Save**
 
-> **Authentication:** If web UI authentication is enabled, the **Username** and **Password** fields are required. The username can be your aMuTorrent username or any value. For the password, use either your aMuTorrent password or your personal API key (found in Settings). If authentication is disabled, leave both fields empty.
+> **Authentication:** If web UI authentication is enabled, fill **either** the API Key field (preferred, newer Sonarr/Radarr) **or** the Username + Password fields — see the next section.
+
+### Authentication modes
+
+If you have web UI authentication enabled, aMuTorrent's qBittorrent-compatible API accepts three modes. Use whichever your client supports:
+
+| Mode | What to enter in Sonarr/Radarr | Notes |
+|---|---|---|
+| **API Key (Bearer)** | Leave Username blank; set the **API Key** field to your personal API key (found in Settings → Sonarr/Radarr integration info). | Recommended for Sonarr ≥ May 2026 / Radarr ≥ equivalent. No login round-trip; the key is sent on every request as `Authorization: Bearer <key>`. |
+| **Username + Password (session cookie)** | **Username**: your aMuTorrent username. **Password**: your aMuTorrent password *or* your personal API key. | The classic qBittorrent flow: client logs in once via `/api/v2/auth/login`, gets a `SID` cookie, reuses it. |
+| **HTTP Basic Auth** | Same field values as username/password mode. | Fallback for direct tooling (`curl`, scripts). Most *arr clients won't use this. |
+
+All three require an **admin** account; non-admin users can't operate the qBit-compatible API. If authentication is disabled server-side, all fields can be left blank.
 
 ---
 

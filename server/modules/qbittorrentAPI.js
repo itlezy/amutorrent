@@ -3,6 +3,7 @@
  * Provides qBittorrent WebUI API v2 compatibility for aMule
  */
 
+const crypto = require('crypto');
 const express = require('express');
 const BaseModule = require('../lib/BaseModule');
 const QBittorrentHandler = require('../lib/qbittorrent/QBittorrentHandler');
@@ -12,68 +13,143 @@ const { parseBasicAuth, verifyPassword } = require('../lib/authUtils');
 // Client registry - replaces direct singleton manager imports
 const registry = require('../lib/ClientRegistry');
 
+// Session TTL for /api/v2 cookie sessions. Sliding-window: extended on each request.
+// Matches qBittorrent's default WebUI session timeout.
+const SID_TTL_MS = 60 * 60 * 1000;
+
 class QBittorrentAPI extends BaseModule {
   constructor() {
     super();
     this.hashStore = null;
     this.handler = new QBittorrentHandler();
+    // sid (hex string) → { userId, expiresAt }
+    this._sessions = new Map();
   }
 
   /**
-   * Middleware to check HTTP Basic Authentication for qBittorrent API (admin-only)
-   * Supports: username+password via Basic Auth, or API key as password.
+   * Issue a new SID for a freshly-authenticated user. Stored in-memory only —
+   * server restart invalidates all sessions, matching qBittorrent's behavior.
+   * @returns {{ sid: string, ttlMs: number }}
    */
-  async checkBasicAuth(req, res, next) {
+  createSession(user) {
+    const sid = crypto.randomBytes(32).toString('hex');
+    this._sessions.set(sid, { userId: user.id, expiresAt: Date.now() + SID_TTL_MS });
+    return { sid, ttlMs: SID_TTL_MS };
+  }
+
+  /**
+   * Validate an SID. Re-fetches the user from DB so admin/disabled changes
+   * since login take effect immediately. Extends expiry on success (sliding window).
+   * @returns {object|null} fresh user object or null on invalid/expired
+   */
+  validateSession(sid) {
+    if (!sid) return null;
+    const entry = this._sessions.get(sid);
+    if (!entry) return null;
+    if (entry.expiresAt < Date.now()) {
+      this._sessions.delete(sid);
+      return null;
+    }
+    if (!this.userManager) return null;
+    const user = this.userManager.getUser(entry.userId);
+    if (!user || user.disabled || !user.is_admin) {
+      this._sessions.delete(sid);
+      return null;
+    }
+    entry.expiresAt = Date.now() + SID_TTL_MS;
+    return user;
+  }
+
+  destroySession(sid) {
+    if (sid) this._sessions.delete(sid);
+  }
+
+  /**
+   * Auth middleware for /api/v2/*. Three accepted modes (in order):
+   *   1. `Authorization: Bearer <apiKey>` — newer Sonarr's preferred mode.
+   *   2. `Cookie: SID=<token>` — classic qBittorrent session flow used by
+   *      Sonarr's username/password mode and qBit-native browser clients.
+   *   3. `Authorization: Basic <base64(user:pass)>` — fallback for curl /
+   *      direct tooling. password may also be an API key.
+   * 401 on no auth provided. 403 on auth provided but rejected (matches
+   * qBittorrent's behavior — Sonarr will then re-login on the SID path).
+   * Admin role required on all paths.
+   */
+  async checkAuth(req, res, next) {
     if (!config.getAuthEnabled()) return next();
 
-    const credentials = parseBasicAuth(req.headers.authorization);
-    if (!credentials) {
-      res.setHeader('WWW-Authenticate', 'Basic realm="qBittorrent"');
-      return res.status(401).send('Unauthorized: Authentication required');
+    if (!this.userManager) {
+      return res.status(500).send('User management not available');
     }
 
-    if (!credentials.password) {
-      res.setHeader('WWW-Authenticate', 'Basic realm="qBittorrent"');
-      return res.status(401).send('Unauthorized: Password required');
-    }
+    const authHeader = req.headers.authorization || '';
 
-    try {
-      if (!this.userManager) {
-        return res.status(500).send('User management not available');
-      }
-
-      // Try username + password login
-      if (credentials.username) {
-        const user = this.userManager.getUserByUsername(credentials.username);
-        if (user && !user.disabled && user.password_hash) {
-          const isValid = await verifyPassword(credentials.password, user.password_hash);
-          if (isValid) {
-            if (!user.is_admin) {
-              return res.status(403).send('Forbidden: Admin access required');
-            }
-            req.apiUser = user;
-            return next();
-          }
-        }
-      }
-
-      // Try API key as password
-      const user = this.userManager.getUserByApiKey(credentials.password);
+    // 1. Bearer API key
+    if (authHeader.startsWith('Bearer ')) {
+      const token = authHeader.slice(7).trim();
+      const user = this.userManager.getUserByApiKey(token);
       if (user && !user.disabled && user.is_admin) {
-        if (credentials.username && user.username !== credentials.username) {
-          res.setHeader('WWW-Authenticate', 'Basic realm="qBittorrent"');
-          return res.status(401).send('Unauthorized: Invalid credentials');
-        }
         req.apiUser = user;
         return next();
       }
-
-      res.setHeader('WWW-Authenticate', 'Basic realm="qBittorrent"');
-      res.status(401).send('Unauthorized: Invalid credentials');
-    } catch (err) {
-      this.error('qBittorrent Basic Auth error:', err);
-      res.status(500).send('Internal server error');
+      return res.status(403).send('Forbidden: Invalid bearer token');
     }
+
+    // 2. SID cookie
+    const sid = req.cookies?.SID;
+    if (sid) {
+      const user = this.validateSession(sid);
+      if (user) {
+        req.apiUser = user;
+        return next();
+      }
+      // qBit returns 403 on expired/invalid session → triggers Sonarr's re-auth path
+      return res.status(403).send('Forbidden: Session expired');
+    }
+
+    // 3. Basic Auth (fallback)
+    if (authHeader.startsWith('Basic ')) {
+      const credentials = parseBasicAuth(authHeader);
+      if (!credentials || !credentials.password) {
+        res.setHeader('WWW-Authenticate', 'Basic realm="qBittorrent"');
+        return res.status(401).send('Unauthorized: Invalid auth header');
+      }
+      try {
+        // Username + password
+        if (credentials.username) {
+          const user = this.userManager.getUserByUsername(credentials.username);
+          if (user && !user.disabled && user.password_hash) {
+            const isValid = await verifyPassword(credentials.password, user.password_hash);
+            if (isValid) {
+              if (!user.is_admin) {
+                return res.status(403).send('Forbidden: Admin access required');
+              }
+              req.apiUser = user;
+              return next();
+            }
+          }
+        }
+        // API key as password
+        const user = this.userManager.getUserByApiKey(credentials.password);
+        if (user && !user.disabled && user.is_admin) {
+          if (credentials.username && user.username !== credentials.username) {
+            res.setHeader('WWW-Authenticate', 'Basic realm="qBittorrent"');
+            return res.status(403).send('Forbidden: Invalid credentials');
+          }
+          req.apiUser = user;
+          return next();
+        }
+        res.setHeader('WWW-Authenticate', 'Basic realm="qBittorrent"');
+        return res.status(403).send('Forbidden: Invalid credentials');
+      } catch (err) {
+        this.error('qBittorrent auth error:', err);
+        return res.status(500).send('Internal server error');
+      }
+    }
+
+    // 4. No auth provided
+    res.setHeader('WWW-Authenticate', 'Basic realm="qBittorrent"');
+    return res.status(401).send('Unauthorized: Authentication required');
   }
 
   /**
@@ -116,7 +192,9 @@ class QBittorrentAPI extends BaseModule {
         config: config,
         registry: registry,
         isFirstRun: () => config.isFirstRun(),
-        userManager: this.userManager
+        userManager: this.userManager,
+        createSession: (user) => this.createSession(user),
+        destroySession: (sid) => this.destroySession(sid)
       });
     }
   }
@@ -129,9 +207,9 @@ class QBittorrentAPI extends BaseModule {
     app.post('/api/v2/auth/login', this.handler.login);
     app.post('/api/v2/auth/logout', this.handler.logout);
 
-    // Protected router with Basic Auth middleware
+    // Protected router. Accepts Bearer API key, SID cookie, or Basic Auth (admin-only).
     const router = express.Router();
-    router.use(this.checkBasicAuth.bind(this));
+    router.use(this.checkAuth.bind(this));
 
     // App endpoints
     router.get('/app/version', this.handler.getVersion);
@@ -184,7 +262,7 @@ class QBittorrentAPI extends BaseModule {
       }
     });
 
-    this.log('🗃️ qBittorrent API routes registered with Basic Auth protection');
+    this.log('🗃️ qBittorrent API routes registered (Bearer / SID cookie / Basic Auth)');
   }
 }
 

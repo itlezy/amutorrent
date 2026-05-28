@@ -49,13 +49,15 @@ class QBittorrentHandler {
   /**
    * Set all dependencies at once
    */
-  setDependencies({ getAmuleClient, getAmuleInstanceId, hashStore, config, registry, isFirstRun, userManager }) {
+  setDependencies({ getAmuleClient, getAmuleInstanceId, hashStore, config, registry, isFirstRun, userManager, createSession, destroySession }) {
     this.getAmuleClient = getAmuleClient;
     this.getAmuleInstanceId = getAmuleInstanceId;
     this.hashStore = hashStore;
     this.config = config;
     this.registry = registry;
     this.userManager = userManager;
+    this.createSession = createSession || null;
+    this.destroySession = destroySession || null;
     if (isFirstRun) this.isFirstRun = isFirstRun;
 
     // Start category initialization and periodic refresh
@@ -84,7 +86,12 @@ class QBittorrentHandler {
 
   /**
    * POST /api/v2/auth/login
+   *
    * Verifies credentials against users.db (username + password or API key)
+   * and, on success, issues a SID cookie scoped to /api/v2/. Sonarr's
+   * username/password mode (and qBit-native browser clients) need the cookie
+   * to authenticate subsequent requests; without it our protected middleware
+   * returns 401 even after a successful login.
    */
   async login(req, res) {
     const authEnabled = this.config.getAuthEnabled();
@@ -106,31 +113,51 @@ class QBittorrentHandler {
         return res.send('Fails.');
       }
 
-      // Try username + password login
+      let authedUser = null;
+      let authMode = null;
+
+      // Try username + password
       if (username) {
         const user = this.userManager.getUserByUsername(username);
         if (user && !user.disabled && user.is_admin && user.password_hash) {
           const isValid = await verifyPassword(password, user.password_hash);
           if (isValid) {
-            logger.log(`[qBittorrent] Login OK: user "${username}" via password`);
-            return res.send('Ok.');
+            authedUser = user;
+            authMode = 'password';
           }
         }
       }
 
-      // Try API key as password
-      const user = this.userManager.getUserByApiKey(password);
-      if (user && !user.disabled && user.is_admin) {
-        if (username && user.username !== username) {
-          logger.warn(`[qBittorrent] Login failed: API key belongs to "${user.username}", not "${username}"`);
-          return res.send('Fails.');
+      // Fall back to API key as password
+      if (!authedUser) {
+        const user = this.userManager.getUserByApiKey(password);
+        if (user && !user.disabled && user.is_admin) {
+          if (!username || user.username === username) {
+            authedUser = user;
+            authMode = 'apikey';
+          } else {
+            logger.warn(`[qBittorrent] Login failed: API key belongs to "${user.username}", not "${username}"`);
+          }
         }
-        logger.log(`[qBittorrent] Login OK: user "${user.username}" via API key`);
-        return res.send('Ok.');
       }
 
-      logger.warn(`[qBittorrent] Login failed: invalid credentials for "${username || 'unknown'}"`);
-      res.send('Fails.');
+      if (!authedUser) {
+        logger.warn(`[qBittorrent] Login failed: invalid credentials for "${username || 'unknown'}"`);
+        return res.send('Fails.');
+      }
+
+      if (this.createSession) {
+        const { sid, ttlMs } = this.createSession(authedUser);
+        res.cookie('SID', sid, {
+          httpOnly: true,
+          path: '/api/v2',
+          sameSite: 'lax',
+          maxAge: ttlMs
+        });
+      }
+
+      logger.log(`[qBittorrent] Login OK: user "${authedUser.username}" via ${authMode}`);
+      res.send('Ok.');
     } catch (err) {
       logger.error('[qBittorrent] Auth error:', err);
       res.send('Fails.');
@@ -139,8 +166,12 @@ class QBittorrentHandler {
 
   /**
    * POST /api/v2/auth/logout
+   * Invalidates the SID and clears the cookie.
    */
   logout(req, res) {
+    const sid = req.cookies?.SID;
+    if (sid && this.destroySession) this.destroySession(sid);
+    res.clearCookie('SID', { path: '/api/v2' });
     res.send('Ok.');
   }
 
